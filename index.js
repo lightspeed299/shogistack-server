@@ -13,7 +13,6 @@ const io = new Server(3001, {
 console.log("将棋サーバー起動: http://localhost:3001");
 
 const rooms = new Map();
-// ソケットIDからユーザー情報を逆引きするためのマップ
 const socketUserMap = new Map();
 
 const stopTimer = (room) => {
@@ -38,28 +37,29 @@ io.on("connection", (socket) => {
         winner: null,
         players: { sente: null, gote: null },
         userIds: { sente: null, gote: null },
-        playerNames: { sente: null, gote: null }, // プレイヤー名を保存
+        playerNames: { sente: null, gote: null },
         ready: { sente: false, gote: false },
         rematchRequests: { sente: false, gote: false },
-        settings: { initial: 600, byoyomi: 30 },
+        settings: { initial: 600, byoyomi: 30, randomTurn: false, fixTurn: false },
         times: { sente: 600, gote: 600 },
         currentByoyomi: { sente: 30, gote: 30 },
         lastMoveTimestamp: 0,
         totalConsumedTimes: { sente: 0, gote: 0 },
-        timerInterval: null
+        timerInterval: null,
+        gameCount: 0
       });
     }
     
     const room = rooms.get(roomId);
 
-    // ★重要: 古いルームデータが残っていた場合の自動修復
-    if (!room.playerNames) {
-        room.playerNames = { sente: null, gote: null };
-    }
+    // 自動修復
+    if (!room.playerNames) room.playerNames = { sente: null, gote: null };
+    if (typeof room.gameCount === 'undefined') room.gameCount = 0;
+    if (typeof room.settings.randomTurn === 'undefined') room.settings.randomTurn = false;
+    if (typeof room.settings.fixTurn === 'undefined') room.settings.fixTurn = false;
 
     let myRole = 'audience';
 
-    // ユーザーID照合＆役割決定（名前も更新）
     if (room.userIds.sente === userId) {
       myRole = 'sente'; room.players.sente = socket.id; room.playerNames.sente = safeName;
     } else if (room.userIds.gote === userId) {
@@ -70,10 +70,8 @@ io.on("connection", (socket) => {
       room.userIds.gote = userId; room.players.gote = socket.id; myRole = 'gote'; room.playerNames.gote = safeName;
     }
 
-    // ソケットとユーザー情報の紐づけを保存
     socketUserMap.set(socket.id, { roomId, userId, userName: safeName, role: myRole });
 
-    // 入室ログ送信
     io.in(roomId).emit("receive_message", { 
       id: generateId(), 
       text: `${safeName} さんが入室しました`, 
@@ -81,7 +79,6 @@ io.on("connection", (socket) => {
       timestamp: Date.now() 
     });
 
-    // クライアントへ同期データを送信
     socket.emit("sync", {
       history: room.history,
       status: room.status,
@@ -94,27 +91,19 @@ io.on("connection", (socket) => {
       playerNames: room.playerNames
     });
     
-    // 全員に最新のプレイヤー名リストを送る
     io.in(roomId).emit("player_names_updated", room.playerNames);
-
     io.in(roomId).emit("ready_status", room.ready);
     io.in(roomId).emit("rematch_status", room.rematchRequests);
   });
 
   socket.on("send_message", ({ roomId, message, role, userName }) => {
-    // クライアントから送られた名前を優先、なければサーバー記録、それもなければ"不明"
     let senderName = userName;
     if (!senderName) {
         const sender = socketUserMap.get(socket.id);
         senderName = sender ? sender.userName : "不明";
     }
-    
     io.in(roomId).emit("receive_message", { 
-        id: generateId(), 
-        text: message, 
-        role, 
-        userName: senderName, 
-        timestamp: Date.now() 
+        id: generateId(), text: message, role, userName: senderName, timestamp: Date.now() 
     });
   });
 
@@ -137,6 +126,61 @@ io.on("connection", (socket) => {
       io.in(roomId).emit("ready_status", room.ready);
 
       if (room.ready.sente && room.ready.gote) {
+        // 振り駒処理
+        let swapped = false;
+        if (room.settings.randomTurn) {
+            const isRematch = room.gameCount > 0;
+            if (isRematch && room.settings.fixTurn) {
+                swapped = false; 
+            } else {
+                if (Math.random() < 0.5) {
+                    swapped = true;
+                }
+            }
+        }
+
+        if (swapped) {
+            [room.players.sente, room.players.gote] = [room.players.gote, room.players.sente];
+            [room.userIds.sente, room.userIds.gote] = [room.userIds.gote, room.userIds.sente];
+            [room.playerNames.sente, room.playerNames.gote] = [room.playerNames.gote, room.playerNames.sente];
+            
+            if (room.players.sente) {
+                const u = socketUserMap.get(room.players.sente);
+                if (u) u.role = 'sente';
+            }
+            if (room.players.gote) {
+                const u = socketUserMap.get(room.players.gote);
+                if (u) u.role = 'gote';
+            }
+            
+            // 新しい役割を各プレイヤーに通知
+            [room.players.sente, room.players.gote, ...Array.from(room.players.audience || [])].forEach(socketId => {
+                if (!socketId) return;
+                const socket = io.sockets.sockets.get(socketId);
+                if (socket) {
+                    const u = socketUserMap.get(socketId);
+                    socket.emit("sync", {
+                        history: [],
+                        status: 'playing',
+                        winner: null,
+                        yourRole: u ? u.role : 'audience',
+                        ready: { sente: false, gote: false },
+                        settings: room.settings,
+                        times: { sente: room.settings.initial, gote: room.settings.initial },
+                        rematchRequests: { sente: false, gote: false },
+                        playerNames: room.playerNames
+                    });
+                }
+            });
+            
+            io.in(roomId).emit("receive_message", { 
+                id: generateId(), 
+                text: "振り駒の結果、手番が入れ替わりました", 
+                role: 'system', 
+                timestamp: Date.now() 
+            });
+        }
+
         stopTimer(room);
         room.history = [];
         room.board = createInitialBoard();
@@ -155,18 +199,25 @@ io.on("connection", (socket) => {
         
         room.lastMoveTimestamp = Date.now();
         room.totalConsumedTimes = { sente: 0, gote: 0 };
+        room.gameCount++;
 
         io.in(roomId).emit("game_started");
-        io.in(roomId).emit("sync", {
-          history: [], 
-          status: 'playing', 
-          winner: null, 
-          ready: room.ready, 
-          settings: room.settings, 
-          times: room.times, 
-          rematchRequests: room.rematchRequests,
-          playerNames: room.playerNames
-        });
+        
+        if (!swapped) {
+             io.in(roomId).emit("sync", {
+                history: [], 
+                status: 'playing', 
+                winner: null, 
+                ready: room.ready, 
+                settings: room.settings, 
+                times: room.times, 
+                rematchRequests: room.rematchRequests, 
+                playerNames: room.playerNames
+            });
+        } else {
+            io.in(roomId).emit("player_names_updated", room.playerNames);
+        }
+        
         startTimer(roomId);
       }
     }
@@ -193,11 +244,8 @@ io.on("connection", (socket) => {
   socket.on("move", ({ roomId, move, branchIndex }) => {
     if (rooms.has(roomId)) {
       const room = rooms.get(roomId);
-      
-      // 自動修復
       if (!room.playerNames) room.playerNames = { sente: null, gote: null };
 
-      // 検討モードまたは終局後の操作
       if (room.status === 'analysis' || room.status === 'finished') {
         if (typeof branchIndex === 'number' && branchIndex < room.history.length) {
            room.history = room.history.slice(0, branchIndex);
@@ -213,24 +261,14 @@ io.on("connection", (socket) => {
         }
         room.history.push(move);
         io.in(roomId).emit("sync", {
-           history: room.history,
-           status: room.status,
-           winner: room.winner,
-           ready: room.ready,
-           settings: room.settings,
-           times: room.times,
-           rematchRequests: room.rematchRequests,
-           playerNames: room.playerNames
+           history: room.history, status: room.status, winner: room.winner, ready: room.ready, settings: room.settings, times: room.times, rematchRequests: room.rematchRequests, playerNames: room.playerNames
         });
         return;
       }
 
-      // --- 通常対局 ---
       const currentTurn = room.history.length % 2 === 0 ? 'sente' : 'gote';
       const nextTurn = currentTurn === 'sente' ? 'gote' : 'sente';
-      
       if (!isValidMove(room.board, room.hands, currentTurn, move)) return; 
-      
       stopTimer(room);
 
       if (room.status === 'playing') {
@@ -246,67 +284,52 @@ io.on("connection", (socket) => {
         
         const isCheck = isKingInCheck(room.board, nextTurn);
         const moveWithInfo = { ...move, isCheck, time: { now: spentSeconds, total: room.totalConsumedTimes[currentTurn] } };
-        
         room.currentByoyomi[currentTurn] = room.settings.byoyomi;
         room.history.push(moveWithInfo);
-        
         io.in(roomId).emit("move", moveWithInfo);
 
-        // 千日手判定ロジック (省略なし)
         const sfen = generateSFEN(room.board, nextTurn, room.hands);
         room.sfenHistory[sfen] = (room.sfenHistory[sfen] || 0) + 1;
-
         if (room.sfenHistory[sfen] >= 4) {
            stopTimer(room);
            room.status = 'finished';
            
+           // 千日手判定ロジック (省略なし)
            let indices = [];
            let tempBoard = createInitialBoard();
            let tempHands = { sente: { ...EMPTY_HAND }, gote: { ...EMPTY_HAND } };
            let tempTurn = 'sente';
-           
            const initialSfen = generateSFEN(tempBoard, 'sente', tempHands);
            if (initialSfen === sfen) indices.push(-1);
-
            room.history.forEach((m, idx) => {
               const r = applyMove(tempBoard, tempHands, m, tempTurn);
               tempBoard = r.board; tempHands = r.hands; tempTurn = r.turn;
               const currentSfen = generateSFEN(tempBoard, tempTurn, tempHands);
               if (currentSfen === sfen) indices.push(idx);
            });
-
            const lastIdx = indices[indices.length - 1]; 
            const prevIdx = indices[indices.length - 2]; 
-           
            let senteContinuousCheck = true;
            let goteContinuousCheck = true;
            let hasSenteMove = false;
            let hasGoteMove = false;
-
            for (let i = prevIdx + 1; i <= lastIdx; i++) {
               const m = room.history[i];
-              if (i % 2 === 0) { 
-                 hasSenteMove = true;
-                 if (!m.isCheck) senteContinuousCheck = false;
-              } else { 
-                 hasGoteMove = true;
-                 if (!m.isCheck) goteContinuousCheck = false;
-              }
+              if (i % 2 === 0) { hasSenteMove = true; if (!m.isCheck) senteContinuousCheck = false; } 
+              else { hasGoteMove = true; if (!m.isCheck) goteContinuousCheck = false; }
            }
-           
-           if (hasSenteMove && senteContinuousCheck) {
-              room.winner = 'gote';
-              io.in(roomId).emit("game_finished", { winner: 'gote', reason: 'illegal_sennichite' });
-           } else if (hasGoteMove && goteContinuousCheck) {
-              room.winner = 'sente';
-              io.in(roomId).emit("game_finished", { winner: 'sente', reason: 'illegal_sennichite' });
-           } else {
-              room.winner = null;
-              io.in(roomId).emit("game_finished", { winner: null, reason: 'sennichite' });
+           if (hasSenteMove && senteContinuousCheck) { 
+               room.winner = 'gote'; 
+               io.in(roomId).emit("game_finished", { winner: 'gote', reason: 'illegal_sennichite' }); 
+           } else if (hasGoteMove && goteContinuousCheck) { 
+               room.winner = 'sente'; 
+               io.in(roomId).emit("game_finished", { winner: 'sente', reason: 'illegal_sennichite' }); 
+           } else { 
+               room.winner = null; 
+               io.in(roomId).emit("game_finished", { winner: null, reason: 'sennichite' }); 
            }
            return;
         }
-
         startTimer(roomId);
       }
     }
@@ -325,40 +348,24 @@ io.on("connection", (socket) => {
   socket.on("undo", (roomId) => {
     if (rooms.has(roomId)) {
       const room = rooms.get(roomId);
-      
-      // 自動修復
       if (!room.playerNames) room.playerNames = { sente: null, gote: null };
-
       if (room.status !== 'playing' && room.history.length > 0) {
         room.history.pop();
-        
-        // 盤面再構築
         let b = createInitialBoard();
         let h = { sente: { ...EMPTY_HAND }, gote: { ...EMPTY_HAND } };
         let t = 'sente';
         room.sfenHistory = {}; 
-        
         const initialSfen = generateSFEN(b, 'sente', h);
         room.sfenHistory[initialSfen] = 1;
-        
         for (const m of room.history) {
            const r = applyMove(b, h, m, t);
            b = r.board; h = r.hands; t = r.turn;
            const sfen = generateSFEN(b, t, h);
            room.sfenHistory[sfen] = (room.sfenHistory[sfen] || 0) + 1;
         }
-        room.board = b;
-        room.hands = h;
-
+        room.board = b; room.hands = h;
         io.in(roomId).emit("sync", {
-          history: room.history, 
-          status: room.status, 
-          winner: room.winner, 
-          ready: room.ready, 
-          settings: room.settings, 
-          times: room.times, 
-          rematchRequests: room.rematchRequests,
-          playerNames: room.playerNames
+          history: room.history, status: room.status, winner: room.winner, ready: room.ready, settings: room.settings, times: room.times, rematchRequests: room.rematchRequests, playerNames: room.playerNames
         });
       }
     }
@@ -367,9 +374,7 @@ io.on("connection", (socket) => {
   socket.on("reset", (roomId) => {
     if (rooms.has(roomId)) {
       const room = rooms.get(roomId);
-      // 自動修復
       if (!room.playerNames) room.playerNames = { sente: null, gote: null };
-
       stopTimer(room);
       room.history = [];
       room.board = createInitialBoard();
@@ -379,15 +384,9 @@ io.on("connection", (socket) => {
       room.ready = { sente: false, gote: false };
       room.rematchRequests = { sente: false, gote: false };
       room.times = { sente: room.settings.initial, gote: room.settings.initial };
+      room.gameCount = 0;
       io.in(roomId).emit("sync", {
-        history: [], 
-        status: room.status, 
-        winner: null, 
-        ready: room.ready, 
-        settings: room.settings, 
-        times: room.times, 
-        rematchRequests: room.rematchRequests,
-        playerNames: room.playerNames
+        history: [], status: room.status, winner: null, ready: room.ready, settings: room.settings, times: room.times, rematchRequests: room.rematchRequests, playerNames: room.playerNames
       });
     }
   });
@@ -396,11 +395,9 @@ io.on("connection", (socket) => {
     if (rooms.has(roomId)) {
       const room = rooms.get(roomId);
       if (!room.playerNames) room.playerNames = { sente: null, gote: null };
-
       if (role !== 'sente' && role !== 'gote') return;
       room.rematchRequests[role] = true;
       io.in(roomId).emit("rematch_status", room.rematchRequests);
-
       if (room.rematchRequests.sente && room.rematchRequests.gote) {
         stopTimer(room);
         room.history = [];
@@ -415,16 +412,8 @@ io.on("connection", (socket) => {
         room.currentByoyomi = { sente: room.settings.byoyomi, gote: room.settings.byoyomi };
         room.lastMoveTimestamp = Date.now();
         room.totalConsumedTimes = { sente: 0, gote: 0 };
-
         io.in(roomId).emit("sync", {
-          history: [], 
-          status: 'waiting', 
-          winner: null, 
-          ready: room.ready, 
-          settings: room.settings, 
-          times: room.times, 
-          rematchRequests: { sente: false, gote: false }, 
-          playerNames: room.playerNames
+          history: [], status: 'waiting', winner: null, ready: room.ready, settings: room.settings, times: room.times, rematchRequests: { sente: false, gote: false }, playerNames: room.playerNames
         });
       }
     }
@@ -433,14 +422,9 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     if (socketUserMap.has(socket.id)) {
       const { roomId, userName, role } = socketUserMap.get(socket.id);
-      
       io.in(roomId).emit("receive_message", { 
-        id: generateId(), 
-        text: `${userName} さんが退出しました`, 
-        role: 'system', 
-        timestamp: Date.now() 
+        id: generateId(), text: `${userName} さんが退出しました`, role: 'system', timestamp: Date.now() 
       });
-
       if (rooms.has(roomId)) {
         const room = rooms.get(roomId);
         if (role === 'sente' || role === 'gote') {

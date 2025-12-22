@@ -3,11 +3,14 @@ const { createInitialBoard, isValidMove, applyMove, generateSFEN, isKingInCheck,
 
 const generateId = () => Math.random().toString(36).substr(2, 9);
 
+// ★修正1: pingTimeout を延ばして通信断絶に強くする
 const io = new Server(3001, {
   cors: { 
     origin: "*", 
     methods: ["GET", "POST"] 
-  }
+  },
+  pingTimeout: 60000, // 60秒間応答がなくても切断しない（デフォルトは20秒）
+  pingInterval: 25000
 });
 
 console.log("将棋サーバー起動: http://localhost:3001");
@@ -52,7 +55,6 @@ io.on("connection", (socket) => {
     
     const room = rooms.get(roomId);
 
-    // 自動修復
     if (!room.playerNames) room.playerNames = { sente: null, gote: null };
     if (typeof room.gameCount === 'undefined') room.gameCount = 0;
     if (typeof room.settings.randomTurn === 'undefined') room.settings.randomTurn = false;
@@ -96,12 +98,10 @@ io.on("connection", (socket) => {
     io.in(roomId).emit("rematch_status", room.rematchRequests);
   });
 
-  // ★修正: userId もメッセージ情報に含めて送信
   socket.on("send_message", ({ roomId, message, role, userName, userId }) => {
     let senderName = userName;
     let senderId = userId;
 
-    // 念のためサーバー情報でも補完
     if (!senderName || !senderId) {
         const sender = socketUserMap.get(socket.id);
         if (sender) {
@@ -117,7 +117,7 @@ io.on("connection", (socket) => {
         text: message, 
         role, 
         userName: senderName, 
-        userId: senderId, // ★重要: これで本人判定を行う
+        userId: senderId, 
         timestamp: Date.now() 
     });
   });
@@ -141,7 +141,6 @@ io.on("connection", (socket) => {
       io.in(roomId).emit("ready_status", room.ready);
 
       if (room.ready.sente && room.ready.gote) {
-        // 振り駒処理
         let swapped = false;
         if (room.settings.randomTurn) {
             const isRematch = room.gameCount > 0;
@@ -168,7 +167,6 @@ io.on("connection", (socket) => {
                 if (u) u.role = 'gote';
             }
             
-            // 新しい役割を各プレイヤーに通知
             [room.players.sente, room.players.gote, ...Array.from(room.players.audience || [])].forEach(socketId => {
                 if (!socketId) return;
                 const socket = io.sockets.sockets.get(socketId);
@@ -246,13 +244,23 @@ io.on("connection", (socket) => {
       if (room.times[turn] > 0) room.times[turn]--;
       else room.currentByoyomi[turn]--;
 
-      if (room.times[turn] === 0 && room.currentByoyomi[turn] === 0) {
+      // ★修正2: 秒読み切れ判定を緩和 (0になってからさらに3秒待つ)
+      // これにより、通信ラグで負けるのを防ぐ
+      if (room.times[turn] === 0 && room.currentByoyomi[turn] <= -1) {
         stopTimer(room);
         room.status = 'finished';
         room.winner = turn === 'sente' ? 'gote' : 'sente';
         io.in(roomId).emit("game_finished", { winner: room.winner, reason: 'timeout' });
       }
-      io.in(roomId).emit("time_update", { times: room.times, currentByoyomi: room.currentByoyomi });
+      
+      // ★修正3: クライアントには0未満の値を送らない (表示が崩れるのを防ぐ)
+      const displayTimes = { ...room.times };
+      const displayByoyomi = {
+          sente: Math.max(0, room.currentByoyomi.sente),
+          gote: Math.max(0, room.currentByoyomi.gote)
+      };
+
+      io.in(roomId).emit("time_update", { times: displayTimes, currentByoyomi: displayByoyomi });
     }, 1000);
   };
 
@@ -299,7 +307,10 @@ io.on("connection", (socket) => {
         
         const isCheck = isKingInCheck(room.board, nextTurn);
         const moveWithInfo = { ...move, isCheck, time: { now: spentSeconds, total: room.totalConsumedTimes[currentTurn] } };
+        
+        // ★修正4: 手を指したら秒読みをリセット (ここでマイナスになっていた値も元に戻る)
         room.currentByoyomi[currentTurn] = room.settings.byoyomi;
+        
         room.history.push(moveWithInfo);
         io.in(roomId).emit("move", moveWithInfo);
 

@@ -1,11 +1,27 @@
 const { Server } = require("socket.io");
 const Database = require('better-sqlite3');
 const { createInitialBoard, isValidMove, applyMove, generateSFEN, isKingInCheck, EMPTY_HAND } = require('./gameUtils');
+// ★追加: sendInfo をインポート
+const { initLogger, sendInfo } = require('./logger');
+
+// 1. ロガーを起動
+initLogger();
+
+// 2. プロセス保護
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION (CRITICAL):', err);
+});
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('UNHANDLED REJECTION:', reason);
+});
 
 const generateId = () => Math.random().toString(36).substr(2, 9);
 
-// DB設定
+// --- DB設定 (最強モード: WAL) ---
 const db = new Database('shogi.db'); 
+db.pragma('journal_mode = WAL'); 
+db.pragma('synchronous = NORMAL'); 
+
 db.prepare(`
   CREATE TABLE IF NOT EXISTS rooms (
     id TEXT PRIMARY KEY,
@@ -23,12 +39,14 @@ const io = new Server(3001, {
   pingInterval: 25000
 });
 
+// ★追加: 起動通知
+sendInfo("🚀 ShogiStack Server Started", "サーバーが正常に起動しました。待機中...");
 console.log("将棋サーバー起動: http://localhost:3001");
 
 const rooms = new Map();
 const socketUserMap = new Map();
 
-// --- 時間フォーマット用ユーティリティ ---
+// --- 時間フォーマット ---
 const formatDuration = (seconds) => {
   if (seconds < 0) return "0秒";
   const m = Math.floor(seconds / 60);
@@ -37,120 +55,18 @@ const formatDuration = (seconds) => {
   return `${m}分${s}秒`;
 };
 
-
-// --- 終局処理の共通関数 ---
-const handleGameEnd = (room, roomId, winner, reason) => {
-    stopTimer(room);
-    room.status = 'finished';
-    room.winner = winner;
-    saveRoom(roomId);
-
-    io.in(roomId).emit("game_finished", { winner, reason });
-
-    const now = Date.now();
-    const gameDurationSec = Math.floor((now - (room.gameStartTime || now)) / 1000);
-    const totalMoves = room.history.length;
-    
-    // 最長思考手の集計
-    let maxThinkSente = { time: 0, moveNum: 0 };
-    let maxThinkGote = { time: 0, moveNum: 0 };
-
-    room.history.forEach((move, idx) => {
-        const thinkTime = move.time ? move.time.now : 0;
-        const moveNum = idx + 1;
-        
-        if (idx % 2 === 0) { // 先手
-            if (thinkTime > maxThinkSente.time) maxThinkSente = { time: thinkTime, moveNum };
-        } else { // 後手
-            if (thinkTime > maxThinkGote.time) maxThinkGote = { time: thinkTime, moveNum };
-        }
-    });
-
-    let reasonText = "";
-    if (reason === 'resign') reasonText = "投了";
-    else if (reason === 'timeout') reasonText = "時間切れ";
-    else if (reason === 'sennichite') reasonText = "千日手";
-    else if (reason === 'illegal_sennichite') reasonText = "反則(連続王手の千日手)";
-
-    // 各プレイヤーへのメッセージ作成関数
-    const sendStatsToPlayer = (role) => {
-        const socketId = room.players[role];
-        if (!socketId) return;
-
-        const isWinner = winner === role;
-        const resultText = winner ? (isWinner ? `あなたの勝ち (${reasonText})` : `あなたの負け (${reasonText})`) : `引き分け (${reasonText})`;
-        
-        const opponentRole = role === 'sente' ? 'gote' : 'sente';
-        
-        const myTimeSec = Math.floor(room.totalConsumedTimes[role] / 1000);
-        const oppTimeSec = Math.floor(room.totalConsumedTimes[opponentRole] / 1000);
-
-        // 自分だけの最長思考手
-        const myMax = role === 'sente' ? maxThinkSente : maxThinkGote;
-
-        // ★追加: 平均考慮時間の計算
-        // 自分の指した手の数（総手数が奇数か偶数かで計算が変わる）
-        let myMoveCount = 0;
-        if (role === 'sente') {
-            myMoveCount = Math.ceil(totalMoves / 2); // 先手は切り上げ (1手なら1回、2手なら1回)
-        } else {
-            myMoveCount = Math.floor(totalMoves / 2); // 後手は切り捨て (1手なら0回、2手なら1回)
-        }
-
-        const avgThinkTime = myMoveCount > 0 ? Math.floor(myTimeSec / myMoveCount) : 0;
-
-        const message = `【対局結果】
-${resultText}
-手数：${totalMoves}手
-対局時間：${formatDuration(gameDurationSec)}
-あなたの消費時間：${formatDuration(myTimeSec)} (平均 ${formatDuration(avgThinkTime)})
-相手の消費時間：${formatDuration(oppTimeSec)}
-最長思考手：${myMax.moveNum > 0 ? `${myMax.moveNum}手目 (${formatDuration(myMax.time)})` : '-'}`;
-
-        // ★修正: 名前を Log(bot) に変更
-        io.to(socketId).emit("receive_message", {
-            id: generateId(),
-            text: message,
-            role: 'log',
-            userName: 'Log', // ここを変更
-            userId: 'system-log',
-            timestamp: Date.now()
-        });
-    };
-
-    sendStatsToPlayer('sente');
-    sendStatsToPlayer('gote');
-};
-
-
-
-
 // --- DBヘルパー ---
-const loadRoomsFromDB = () => {
-  try {
-    const rows = db.prepare("SELECT * FROM rooms").all();
-    let count = 0;
-    for (const row of rows) {
-      try {
-        const roomData = JSON.parse(row.data);
-        roomData.timerInterval = null; 
-        rooms.set(row.id, roomData);
-        count++;
-      } catch (e) {
-        console.error(`Room ${row.id} parse error:`, e);
-      }
-    }
-    console.log(`${count} rooms loaded from DB.`);
-  } catch (e) {
-    console.error("DB Load Error:", e);
-  }
-};
-
 const saveRoom = (roomId) => {
   const room = rooms.get(roomId);
   if (!room) return;
   const { timerInterval, ...dataToSave } = room;
-  const json = JSON.stringify(dataToSave);
+  let json;
+  try {
+    json = JSON.stringify(dataToSave);
+  } catch (e) {
+    console.error(`Save Error: JSON stringify failed for room ${roomId}`, e);
+    return; 
+  }
   const now = Date.now();
   try {
     db.prepare(`
@@ -162,6 +78,28 @@ const saveRoom = (roomId) => {
   }
 };
 
+const loadRoomsFromDB = () => {
+  try {
+    const rows = db.prepare("SELECT * FROM rooms").all();
+    let count = 0;
+    for (const row of rows) {
+      try {
+        const roomData = JSON.parse(row.data);
+        roomData.timerInterval = null; 
+        rooms.set(row.id, roomData);
+        count++;
+      } catch (e) {
+        console.error(`CRITICAL: Room ${row.id} data corrupted in DB!`, e);
+      }
+    }
+    console.log(`${count} rooms loaded from DB.`);
+  } catch (e) {
+    console.error("DB Load Error:", e);
+  }
+};
+loadRoomsFromDB();
+
+// 定期クリーンアップ
 setInterval(() => {
   const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
   try {
@@ -170,6 +108,7 @@ setInterval(() => {
       for (const [id, room] of rooms.entries()) {
         const roomSockets = io.sockets.adapter.rooms.get(id);
         if (room.lastMoveTimestamp < oneDayAgo && (!roomSockets || roomSockets.size === 0)) {
+           stopTimer(room);
            rooms.delete(id);
         }
       }
@@ -179,7 +118,67 @@ setInterval(() => {
   }
 }, 60 * 60 * 1000);
 
-loadRoomsFromDB();
+// --- 終局処理 ---
+const handleGameEnd = (room, roomId, winner, reason) => {
+    stopTimer(room);
+    room.status = 'finished';
+    room.winner = winner;
+    saveRoom(roomId);
+
+    io.in(roomId).emit("game_finished", { winner, reason });
+
+    // ★追加: 終局通知
+    sendInfo("🏁 Game Finished", `Room: ${roomId}`, [
+        { name: "Winner", value: winner || "Draw" },
+        { name: "Reason", value: reason }
+    ]);
+
+    const now = Date.now();
+    const gameDurationSec = Math.floor((now - (room.gameStartTime || now)) / 1000);
+    const totalMoves = room.history.length;
+    
+    let maxThinkSente = { time: 0, moveNum: 0 };
+    let maxThinkGote = { time: 0, moveNum: 0 };
+
+    room.history.forEach((move, idx) => {
+        const thinkTime = move.time ? move.time.now : 0;
+        const moveNum = idx + 1;
+        if (idx % 2 === 0) { 
+            if (thinkTime > maxThinkSente.time) maxThinkSente = { time: thinkTime, moveNum };
+        } else { 
+            if (thinkTime > maxThinkGote.time) maxThinkGote = { time: thinkTime, moveNum };
+        }
+    });
+
+    let reasonText = "";
+    if (reason === 'resign') reasonText = "投了";
+    else if (reason === 'timeout') reasonText = "時間切れ";
+    else if (reason === 'sennichite') reasonText = "千日手";
+    else if (reason === 'illegal_sennichite') reasonText = "反則(連続王手の千日手)";
+
+    const sendStatsToPlayer = (role) => {
+        const socketId = room.players[role];
+        if (!socketId) return;
+        const isWinner = winner === role;
+        const resultText = winner ? (isWinner ? `あなたの勝ち (${reasonText})` : `あなたの負け (${reasonText})`) : `引き分け (${reasonText})`;
+        const opponentRole = role === 'sente' ? 'gote' : 'sente';
+        const myTimeSec = Math.floor(room.totalConsumedTimes[role] / 1000);
+        const oppTimeSec = Math.floor(room.totalConsumedTimes[opponentRole] / 1000);
+        const myMax = role === 'sente' ? maxThinkSente : maxThinkGote;
+        let myMoveCount = 0;
+        if (role === 'sente') myMoveCount = Math.ceil(totalMoves / 2);
+        else myMoveCount = Math.floor(totalMoves / 2);
+        const avgThinkTime = myMoveCount > 0 ? Math.floor(myTimeSec / myMoveCount) : 0;
+
+        const message = `【対局結果】\n${resultText}\n手数：${totalMoves}手\n対局時間：${formatDuration(gameDurationSec)}\nあなたの消費時間：${formatDuration(myTimeSec)} (平均 ${formatDuration(avgThinkTime)})\n相手の消費時間：${formatDuration(oppTimeSec)}\n最長思考手：${myMax.moveNum > 0 ? `${myMax.moveNum}手目 (${formatDuration(myMax.time)})` : '-'}`;
+
+        io.to(socketId).emit("receive_message", {
+            id: generateId(), text: message, role: 'log', userName: 'Log', userId: 'system-log', timestamp: Date.now()
+        });
+    };
+    sendStatsToPlayer('sente');
+    sendStatsToPlayer('gote');
+};
 
 const stopTimer = (room) => {
   if (room.timerInterval) { clearInterval(room.timerInterval); room.timerInterval = null; }
@@ -206,9 +205,15 @@ io.on("connection", (socket) => {
   console.log("接続:", socket.id);
   io.emit("update_global_count", io.engine.clientsCount);
 
+  // Ping計測
+  socket.on("ping_latency", (callback) => { if (typeof callback === "function") callback(); });
+
   socket.on("join_room", ({ roomId, mode, userId, userName }) => {
     socket.join(roomId);
     const safeName = userName || "名無し";
+
+    // ★追加: 入室通知
+    sendInfo("➕ User Joined", `${safeName} joined Room: ${roomId}`);
 
     if (!rooms.has(roomId)) {
       rooms.set(roomId, {
@@ -232,11 +237,9 @@ io.on("connection", (socket) => {
         gameCount: 0,
         gameStartTime: 0
       });
-      saveRoom(roomId);
     }
     
     const room = rooms.get(roomId);
-    
     if (!room.playerNames) room.playerNames = { sente: null, gote: null };
     if (typeof room.gameCount === 'undefined') room.gameCount = 0;
     if (typeof room.settings.randomTurn === 'undefined') room.settings.randomTurn = false;
@@ -261,15 +264,9 @@ io.on("connection", (socket) => {
     });
 
     socket.emit("sync", {
-      history: room.history,
-      status: room.status,
-      winner: room.winner,
-      yourRole: myRole,
-      ready: room.ready,
-      settings: room.settings,
-      times: room.times,
-      rematchRequests: room.rematchRequests,
-      playerNames: room.playerNames
+      history: room.history, status: room.status, winner: room.winner, yourRole: myRole,
+      ready: room.ready, settings: room.settings, times: room.times,
+      rematchRequests: room.rematchRequests, playerNames: room.playerNames
     });
     
     io.in(roomId).emit("player_names_updated", room.playerNames);
@@ -280,13 +277,18 @@ io.on("connection", (socket) => {
   });
 
   socket.on("send_message", ({ roomId, message, role, userName, userId }) => {
+    // ★追加: テスト用爆弾コマンド
+    if (message === "/test_error") {
+        throw new Error("This is a TEST ERROR for Discord notification check.");
+    }
+
     let senderName = userName;
     let senderId = userId;
     if (!senderName || !senderId) {
         const sender = socketUserMap.get(socket.id);
         if (sender) {
-            if (!senderName) senderName = sender.userName;
-            if (!senderId) senderId = sender.userId;
+            senderName = senderName || sender.userName;
+            senderId = senderId || sender.userId;
         } else {
             senderName = senderName || "不明";
         }
@@ -311,7 +313,6 @@ io.on("connection", (socket) => {
     if (rooms.has(roomId)) {
       const room = rooms.get(roomId);
       if (role !== 'sente' && role !== 'gote') return;
-
       room.ready[role] = !room.ready[role];
       io.in(roomId).emit("ready_status", room.ready);
 
@@ -322,27 +323,20 @@ io.on("connection", (socket) => {
             if (isRematch && room.settings.fixTurn) swapped = false; 
             else if (Math.random() < 0.5) swapped = true;
         }
-
         if (swapped) {
             [room.players.sente, room.players.gote] = [room.players.gote, room.players.sente];
             [room.userIds.sente, room.userIds.gote] = [room.userIds.gote, room.userIds.sente];
             [room.playerNames.sente, room.playerNames.gote] = [room.playerNames.gote, room.playerNames.sente];
             
-            if (room.players.sente) {
-                const u = socketUserMap.get(room.players.sente);
-                if (u) u.role = 'sente';
-            }
-            if (room.players.gote) {
-                const u = socketUserMap.get(room.players.gote);
-                if (u) u.role = 'gote';
-            }
+            if (room.players.sente) { const u = socketUserMap.get(room.players.sente); if (u) u.role = 'sente'; }
+            if (room.players.gote) { const u = socketUserMap.get(room.players.gote); if (u) u.role = 'gote'; }
             
             [room.players.sente, room.players.gote, ...Array.from(room.players.audience || [])].forEach(socketId => {
                 if (!socketId) return;
-                const socket = io.sockets.sockets.get(socketId);
-                if (socket) {
+                const s = io.sockets.sockets.get(socketId);
+                if (s) {
                     const u = socketUserMap.get(socketId);
-                    socket.emit("sync", {
+                    s.emit("sync", {
                         history: [], status: 'playing', winner: null, yourRole: u ? u.role : 'audience',
                         ready: { sente: false, gote: false }, settings: room.settings,
                         times: { sente: room.settings.initial, gote: room.settings.initial },
@@ -350,9 +344,7 @@ io.on("connection", (socket) => {
                     });
                 }
             });
-            io.in(roomId).emit("receive_message", { 
-                id: generateId(), text: "振り駒の結果、手番が入れ替わりました", role: 'system', timestamp: Date.now() 
-            });
+            io.in(roomId).emit("receive_message", { id: generateId(), text: "振り駒の結果、手番が入れ替わりました", role: 'system', timestamp: Date.now() });
         }
 
         stopTimer(room);
@@ -360,7 +352,6 @@ io.on("connection", (socket) => {
         room.board = createInitialBoard();
         room.hands = { sente: { ...EMPTY_HAND }, gote: { ...EMPTY_HAND } };
         room.sfenHistory = {}; 
-        
         const initialSfen = generateSFEN(room.board, 'sente', room.hands);
         room.sfenHistory[initialSfen] = 1;
 
@@ -368,10 +359,8 @@ io.on("connection", (socket) => {
         room.winner = null;
         room.ready = { sente: false, gote: false };
         room.rematchRequests = { sente: false, gote: false };
-        
         room.times = { sente: room.settings.initial, gote: room.settings.initial };
         room.currentByoyomi = { sente: room.settings.byoyomi, gote: room.settings.byoyomi };
-        
         room.lastMoveTimestamp = Date.now();
         room.totalConsumedTimes = { sente: 0, gote: 0 };
         room.gameCount++;
@@ -380,6 +369,9 @@ io.on("connection", (socket) => {
         saveRoom(roomId);
         io.in(roomId).emit("game_started");
         
+        // ★追加: 対局開始通知
+        sendInfo("⚔️ Game Started", `Room: ${roomId}, Sente: ${room.playerNames.sente}, Gote: ${room.playerNames.gote}`);
+
         if (!swapped) {
              io.in(roomId).emit("sync", {
                 history: [], status: 'playing', winner: null, ready: room.ready, settings: room.settings,
@@ -388,7 +380,6 @@ io.on("connection", (socket) => {
         } else {
             io.in(roomId).emit("player_names_updated", room.playerNames);
         }
-        
         broadcastConnectionStatus(roomId);
         startTimer(roomId);
       }
@@ -404,9 +395,7 @@ io.on("connection", (socket) => {
       const now = Date.now();
       const elapsedTotalMs = now - room.lastMoveTimestamp;
       const elapsedSeconds = Math.floor(elapsedTotalMs / 1000);
-
       const currentRemaining = room.times[turn] - elapsedSeconds;
-
       let displayTimes = { ...room.times };
       let displayByoyomi = { ...room.currentByoyomi };
 
@@ -417,13 +406,11 @@ io.on("connection", (socket) => {
           const overTime = -currentRemaining; 
           const remainingByoyomi = room.settings.byoyomi - overTime;
           displayByoyomi[turn] = remainingByoyomi;
-
           if (remainingByoyomi <= -1) {
             handleGameEnd(room, roomId, turn === 'sente' ? 'gote' : 'sente', 'timeout');
             return;
           }
       }
-
       io.in(roomId).emit("time_update", { 
           times: { sente: Math.max(0, displayTimes.sente), gote: Math.max(0, displayTimes.gote) }, 
           currentByoyomi: { sente: Math.max(0, displayByoyomi.sente), gote: Math.max(0, displayByoyomi.gote) }
@@ -446,8 +433,7 @@ io.on("connection", (socket) => {
               const r = applyMove(b, h, m, t);
               b = r.board; h = r.hands; t = r.turn;
            }
-           room.board = b;
-           room.hands = h;
+           room.board = b; room.hands = h;
         }
         room.history.push(move);
         saveRoom(roomId);
@@ -465,37 +451,23 @@ io.on("connection", (socket) => {
       if (room.status === 'playing') {
         const now = Date.now();
         const spentTimeMs = now - room.lastMoveTimestamp;
-        
-        // ★修正: 持ち時間計算用（秒単位の切り捨て）
         const spentSecondsForTimer = Math.floor(spentTimeMs / 1000);
         
         if (room.times[currentTurn] > 0) {
             room.times[currentTurn] = Math.max(0, room.times[currentTurn] - spentSecondsForTimer);
         }
-
-        // ★修正: 集計用はミリ秒単位で正確に加算
         room.totalConsumedTimes[currentTurn] += spentTimeMs;
         room.lastMoveTimestamp = now;
 
         const res = applyMove(room.board, room.hands, move, currentTurn);
-        room.board = res.board;
-        room.hands = res.hands;
+        room.board = res.board; room.hands = res.hands;
         
         const isCheck = isKingInCheck(room.board, nextTurn);
-        const moveWithInfo = { 
-            ...move, 
-            isCheck, 
-            time: { 
-                now: spentSecondsForTimer, // クライアント表示は秒でOK
-                total: Math.floor(room.totalConsumedTimes[currentTurn] / 1000) // 表示用合計も秒に変換
-            } 
-        };
+        const moveWithInfo = { ...move, isCheck, time: { now: spentSecondsForTimer, total: Math.floor(room.totalConsumedTimes[currentTurn] / 1000) } };
         
         room.currentByoyomi[currentTurn] = room.settings.byoyomi;
-        
         room.history.push(moveWithInfo);
         saveRoom(roomId);
-
         io.in(roomId).emit("move", moveWithInfo);
 
         const sfen = generateSFEN(room.board, nextTurn, room.hands);
@@ -503,11 +475,7 @@ io.on("connection", (socket) => {
         if (room.sfenHistory[sfen] >= 4) {
            stopTimer(room);
            room.status = 'finished';
-           
-           let indices = [];
-           let tempBoard = createInitialBoard();
-           let tempHands = { sente: { ...EMPTY_HAND }, gote: { ...EMPTY_HAND } };
-           let tempTurn = 'sente';
+           let indices = []; let tempBoard = createInitialBoard(); let tempHands = { sente: { ...EMPTY_HAND }, gote: { ...EMPTY_HAND } }; let tempTurn = 'sente';
            const initialSfen = generateSFEN(tempBoard, 'sente', tempHands);
            if (initialSfen === sfen) indices.push(-1);
            room.history.forEach((m, idx) => {
@@ -516,25 +484,16 @@ io.on("connection", (socket) => {
               const currentSfen = generateSFEN(tempBoard, tempTurn, tempHands);
               if (currentSfen === sfen) indices.push(idx);
            });
-           const lastIdx = indices[indices.length - 1]; 
-           const prevIdx = indices[indices.length - 2]; 
-           let senteContinuousCheck = true;
-           let goteContinuousCheck = true;
-           let hasSenteMove = false;
-           let hasGoteMove = false;
+           const lastIdx = indices[indices.length - 1]; const prevIdx = indices[indices.length - 2]; 
+           let senteContinuousCheck = true; let goteContinuousCheck = true; let hasSenteMove = false; let hasGoteMove = false;
            for (let i = prevIdx + 1; i <= lastIdx; i++) {
               const m = room.history[i];
               if (i % 2 === 0) { hasSenteMove = true; if (!m.isCheck) senteContinuousCheck = false; } 
               else { hasGoteMove = true; if (!m.isCheck) goteContinuousCheck = false; }
            }
-           
-           if (hasSenteMove && senteContinuousCheck) { 
-               handleGameEnd(room, roomId, 'gote', 'illegal_sennichite');
-           } else if (hasGoteMove && goteContinuousCheck) { 
-               handleGameEnd(room, roomId, 'sente', 'illegal_sennichite');
-           } else { 
-               handleGameEnd(room, roomId, null, 'sennichite');
-           }
+           if (hasSenteMove && senteContinuousCheck) handleGameEnd(room, roomId, 'gote', 'illegal_sennichite');
+           else if (hasGoteMove && goteContinuousCheck) handleGameEnd(room, roomId, 'sente', 'illegal_sennichite');
+           else handleGameEnd(room, roomId, null, 'sennichite');
            return;
         }
         startTimer(roomId);
@@ -626,10 +585,17 @@ io.on("connection", (socket) => {
     }
   });
   
-  socket.on("disconnect", () => {
+  // ★追加・修正: 切断時通知ロジック (理由付き)
+  socket.on("disconnect", (reason) => {
     if (socketUserMap.has(socket.id)) {
       const { roomId, userName, role } = socketUserMap.get(socket.id);
       
+      // ★ 通知: 切断
+      sendInfo("➖ User Disconnected", `${userName} (ID: ${socket.id})`, [
+          { name: "Reason", value: reason || "Unknown" },
+          { name: "Room", value: roomId }
+      ]);
+
       socketUserMap.delete(socket.id); 
       broadcastUserCounts(roomId);     
       broadcastConnectionStatus(roomId);
@@ -651,6 +617,6 @@ io.on("connection", (socket) => {
         }
       }
     }
-    console.log("切断:", socket.id);
+    console.log("切断:", socket.id, "理由:", reason);
   });
 });

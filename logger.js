@@ -11,7 +11,7 @@ const sendDiscordPayload = (title, message, color, fields = []) => {
 
   const payload = JSON.stringify({
     username: "ShogiStack Monitor",
-    avatar_url: "https://cdn-icons-png.flaticon.com/512/569/569513.png",
+    avatar_url: "https://www.come-toto.com/wp-content/uploads/2022/07/c454eaf08ab8f5ea7a476f5930c46ed3.jpeg",
     embeds: [{
       title: title,
       description: message,
